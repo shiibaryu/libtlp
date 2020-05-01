@@ -1,6 +1,7 @@
 /*
  * libtlp.c
  */
+#define _GNU_SOURCE
 #include <stdio.h>	/* for debug */
 #include <errno.h>
 #include <string.h>
@@ -9,6 +10,8 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <poll.h>
+#include <sched.h>
+#include <pthread.h>
 
 #include <libtlp.h>
 #include <tlp.h>
@@ -590,8 +593,18 @@ dma_write_aligned(struct nettlp *nt, uintptr_t addr, void *buf,
  * Callback API for pseudo memory process
  */
 
+struct nettlp_mqpoll_arg{
+	void *arg;
+	int cpu;
+	int offset;
+	struct nettlp *nt;
+	struct pollfd x;
+	struct nettlp_cb *cb;
+};
+
 static int stop_flag = 0;
 
+/*
 int nettlp_run_cb(struct nettlp **nt, int nnts,
 		  struct nettlp_cb *cb, void *arg)
 {
@@ -624,7 +637,7 @@ int nettlp_run_cb(struct nettlp **nt, int nnts,
 			break;
 
 		if (ret == 0)
-			continue;	/* timeout */
+			continue;	
 
 		for (n = 0; n < nnts; n++) {
 
@@ -664,6 +677,100 @@ int nettlp_run_cb(struct nettlp **nt, int nnts,
 	}
 
 	return ret;
+}
+*/
+
+void *nettlp_mq_poll(void *arg)
+{
+	int n= 0;
+	int ret = 0;
+	ssize_t received;
+	char buf[4096];
+	struct nettlp_hdr *nh;
+	struct tlp_hdr *th;
+	struct tlp_mr_hdr *mh;
+	struct tlp_cpl_hdr *ch;
+
+	struct nettlp_mqpoll_arg *mqp = arg;
+	struct pollfd x[1] = {{.fd = mqp->x.fd, .events = POLLIN}};
+	struct nettlp *nt = mqp->nt;
+	struct nettlp_cb *cb = mqp->cb;
+
+	while (1) {
+
+		if (stop_flag)
+			break;
+
+		ret = poll(x, 1 , LIBTLP_CPL_TIMEOUT);
+		if (ret < 0)
+			break;
+
+		if (ret == 0)
+			continue;	/* timeout */
+
+		if (!(x[n].revents & POLLIN))
+			continue;
+
+		ret = read(nt->sockfd, buf, sizeof(buf));
+		if (ret < 0)
+			break;
+
+		nh = (struct nettlp_hdr *)buf;
+		th = (struct tlp_hdr *)(nh + 1);
+		mh = (struct tlp_mr_hdr *)th;
+		ch = (struct tlp_cpl_hdr *)th;
+
+		if (tlp_is_mrd(th->fmt_type) && cb->mrd) {
+			cb->mrd(nt, mh, mqp->arg);
+		} else if (tlp_is_mwr(th->fmt_type) && cb->mwr) {
+			cb->mwr(nt, mh, tlp_mwr_data(mh),
+				tlp_mr_data_length(mh), mqp->arg);
+		} else if (tlp_is_cpl(th->fmt_type) &&
+			tlp_is_wo_data(th->fmt_type) && cb->cpl) {
+				cb->cpl(nt, ch, mqp->arg);
+		} else if (tlp_is_cpl(th->fmt_type) &&
+			tlp_is_w_data(th->fmt_type) && cb->cpld) {
+				cb->cpld(nt, ch, tlp_cpld_data(ch),
+						tlp_cpld_data_length(ch), mqp->arg);
+		} else if (cb->other) {
+			cb->other(nt, th, mqp->arg);
+		}
+	}
+}
+
+int nettlp_run_cb(struct nettlp **nt,int nnts,
+		struct nettlp_cb *cb, void *arg)
+{
+	int ret = 0,n;
+	pthread_t sock_tid[nnts];
+	cpu_set_t target_cpu_set;
+	struct nettlp_mqpoll_arg mtq[nnts];
+	struct nettlp_mnic *mnic = arg;
+
+	if(nnts > NETTLP_CB_MAX_NTS){
+		errno = -EINVAL;
+		return -1;
+	}
+
+	for(n = 0; n < nnts; n++){
+		mtq[n].nt = nt[n];
+		mtq[n].arg = arg;
+		mtq[n].offset = n;
+		mtq[n].cb = cb;
+		mtq[n].x.fd = nt[n]->sockfd;
+		mtq[n].x.events = POLLIN;
+		mtq[n].cpu = nt[n]->tag;
+
+		pthread_create(&sock_tid[n],NULL,nettlp_mq_poll,&mtq[n]);
+		
+		CPU_ZERO(&target_cpu_set);
+		CPU_SET(mtq[n].cpu,&target_cpu_set);
+		pthread_setaffinity_np(sock_tid[n],sizeof(cpu_set_t),&target_cpu_set);
+	}
+
+	for(n=0;n<nnts;n++){
+		pthread_join(sock_tid[n],NULL);
+	}
 }
 
 void nettlp_stop_cb(void)
